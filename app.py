@@ -1,7 +1,8 @@
-# app.py — GLPI ↔ Ollama (Qwen 2.5) — mémoire + opt-out + similarité par titre + extraction auto de mots-clés + cache + perfs
-# Dépendances: requests, python-dotenv
+# app.py — GLPI ↔ Ollama (Qwen 2.5) — v2
+# Améliorations : embeddings (optionnel via Ollama), tronquage réponses, logs JSON,
+# détection contenu sensible, alias enrichis, mémo par ticket (KV), scoring hybride (keywords + embeddings).
 
-import os, json, time, argparse, unicodedata, difflib, re
+import os, json, time, argparse, unicodedata, difflib, re, hashlib, math
 from collections import Counter
 from pathlib import Path
 import requests
@@ -58,20 +59,45 @@ SIMILAR_PAGE_SIZE   = int(os.getenv("SIMILAR_PAGE_SIZE", "200"))
 SIMILAR_MAX_PAGES   = int(os.getenv("SIMILAR_MAX_PAGES", "25"))
 SIMILAR_FETCH_ORDER = (os.getenv("SIMILAR_FETCH_ORDER", "desc") or "desc").lower()
 
-TITLE_KEYWORD_WEIGHT = float(os.getenv("TITLE_KEYWORD_WEIGHT", "0.65"))
-CONTENT_WEIGHT       = float(os.getenv("CONTENT_WEIGHT", "0.35"))
+TITLE_KEYWORD_WEIGHT = float(os.getenv("TITLE_KEYWORD_WEIGHT", "0.5"))
+CONTENT_WEIGHT       = float(os.getenv("CONTENT_WEIGHT", "0.25"))
+KEYWORD_SIM_WEIGHT   = float(os.getenv("KEYWORD_SIM_WEIGHT", "0.15"))
+EMBEDDING_WEIGHT     = float(os.getenv("EMBEDDING_WEIGHT", "0.35"))  # pondération cosine
 MIN_TITLE_OVERLAP    = int(os.getenv("MIN_TITLE_OVERLAP", "1"))
 
-SIMILAR_INDEX_CACHE  = os.getenv("SIMILAR_INDEX_CACHE", "similar_index.json")
+SIMILAR_INDEX_CACHE   = os.getenv("SIMILAR_INDEX_CACHE", "similar_index.json")
 SIMILAR_CACHE_TTL_MIN = int(os.getenv("SIMILAR_CACHE_TTL_MIN", "60"))
 
-# Extraction & réutilisation de mots-clés
+# Embeddings via Ollama (optionnel, ex: "nomic-embed-text" / "gte-small" / "mxbai-embed-large")
+OLLAMA_EMBED_MODEL    = (os.getenv("OLLAMA_EMBED_MODEL") or "").strip()
+SIMILAR_EMB_CACHE     = os.getenv("SIMILAR_EMB_CACHE", "similar_embeds.json")
+SIMILAR_EMB_TTL_MIN   = int(os.getenv("SIMILAR_EMB_TTL_MIN", "240"))
+
+# Extraction mots-clés
 KEYWORDS_TOP_K     = int(os.getenv("KEYWORDS_TOP_K", "8"))
-KEYWORD_SIM_WEIGHT = float(os.getenv("KEYWORD_SIM_WEIGHT", "0.25"))
+
+# Sécurité & sortie
+MAX_REPLY_CHARS    = int(os.getenv("MAX_REPLY_CHARS", "1200"))   # tronquage doux
+LOG_JSON           = os.getenv("LOG_JSON", "1") == "1"
+LOG_FILE           = (os.getenv("LOG_FILE") or "").strip()
 
 def dprint(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
+
+def log_event(ev: dict):
+    """Journalisation JSON line (stdout + optionnel fichier)."""
+    try:
+        line = json.dumps(ev, ensure_ascii=False)
+    except Exception:
+        line = str(ev)
+    print(line)
+    if LOG_FILE:
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 # Statuts cibles (par défaut 1,2,3). Ajoutez d'autres via ADD_STATUS="4,5"
 TARGET_STATUSES = {"1", "2", "3"}
@@ -84,7 +110,6 @@ if ADD_STATUS:
 HEADERS_JSON = {"Content-Type": "application/json"}
 BOT_SIGNATURE = "— Réponse générée par Qwen (brouillon)"
 
-# Règles système spécialisées "université" + sortie étendue (audience/public_reply)
 SYSTEM_RULES = (
     "Tu es l’assistant du support informatique de " + ORG + ".\n"
     "Public: étudiants, enseignants, chercheurs, personnels.\n\n"
@@ -92,10 +117,10 @@ SYSTEM_RULES = (
     "Si l’utilisateur peut résoudre seul (procédure sûre, simple, sans droits élevés) => audience=user, public_reply=true.\n"
     "Sinon => audience=technician, public_reply=false, et détaille précisément la démarche côté technicien.\n\n"
     "Principes:\n"
-    "- Réponds poliment et clairement en FR (ou en EN si le ticket est en anglais).\n"
+    "- Réponds poliment et clairement en FR (ou EN si le ticket est en anglais).\n"
     "- Ne répète jamais une question déjà posée dans ce ticket.\n"
     "- Limite-toi à 2 questions max par réponse et 4–6 étapes de diagnostic numérotées.\n"
-    "- Si l’utilisateur n’a rien à l’écran, privilégie d’abord écran/alimentation/câbles/source avant tout test logiciel.\n"
+    "- Si l’utilisateur n’a rien à l’écran, commence par écran/alimentation/câbles/source.\n"
     "- Jamais d’action destructive. Respecte la confidentialité/RGPD.\n"
     "- Si l’utilisateur demande un technicien/humain, l’orchestrateur arrêtera le bot pour ce ticket.\n\n"
     f"Raccourcis utiles:\n- Portail d’assistance : {PORT}\n- Standard support : {PHONE} (horaires : {HOURS})\n\n"
@@ -128,14 +153,11 @@ JSON_SCHEMA = {
 #            STATE
 # ===============================
 def normalize_state(s: dict) -> dict:
-    if not isinstance(s, dict):
-        s = {}
-    if "last_seen_public" not in s or not isinstance(s["last_seen_public"], dict):
-        s["last_seen_public"] = {}
-    if "opt_out" not in s or not isinstance(s["opt_out"], dict):
-        s["opt_out"] = {}
-    if "keywords" not in s or not isinstance(s["keywords"], dict):
-        s["keywords"] = {}
+    if not isinstance(s, dict): s = {}
+    s.setdefault("last_seen_public", {})
+    s.setdefault("opt_out", {})
+    s.setdefault("keywords", {})
+    s.setdefault("ticket_meta", {})  # nouveau : mémo par ticket (audience, confidence, etc.)
     return s
 
 def load_state():
@@ -144,7 +166,7 @@ def load_state():
             return normalize_state(json.loads(STATE_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
-    return {"last_seen_public": {}, "opt_out": {}, "keywords": {}}
+    return normalize_state({})
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(normalize_state(state), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -168,7 +190,6 @@ def glpi_headers(session_token):
     return {"App-Token": GLPI_APP_TOKEN, "Session-Token": session_token, "Content-Type": "application/json"}
 
 def ensure_ticket_dict(session_token, t):
-    """Normalise un ticket: si 't' est un id brut, récupère l'objet complet."""
     if isinstance(t, dict):
         return t
     if isinstance(t, (int, str)) and str(t).isdigit():
@@ -179,7 +200,6 @@ def ensure_ticket_dict(session_token, t):
     return None
 
 def glpi_list_active_tickets(session_token, limit=200):
-    """Liste /Ticket/ puis filtre status∈TARGET_STATUSES (+ entité optionnelle)."""
     r = requests.get(f"{GLPI_URL}/Ticket/", headers=glpi_headers(session_token),
                      params={"range": f"0-{limit-1}"}, timeout=30)
     r.raise_for_status()
@@ -210,7 +230,6 @@ def glpi_get_followups(session_token, ticket_id):
     return data if isinstance(data, list) else []
 
 def glpi_get_solution(session_token, ticket_id):
-    """Essaye de récupérer l'objet ITILSolution si exposé."""
     try:
         r = requests.get(f"{GLPI_URL}/Ticket/{ticket_id}/ITILSolution", headers=glpi_headers(session_token), timeout=30)
         if r.status_code != 200: return None
@@ -254,20 +273,24 @@ FR_STOPWORDS = {
 }
 
 ALIASES = {
-    # réseaux / wifi
-    "wi-fi":"wifi","wifi":"wifi","eduroam":"wifi","wpa":"wifi",
-    # vpn
-    "vpn":"vpn","anyconnect":"vpn","openvpn":"vpn",
-    # messagerie
-    "outlook":"outlook","exchange":"outlook","boite":"outlook","mail":"outlook","courriel":"outlook",
-    # pédagogie
-    "moodle":"moodle","teams":"visioconf","zoom":"visioconf",
-    # affichage / matériel
+    # Réseaux / wifi
+    "wi-fi":"wifi","wifi":"wifi","eduroam":"wifi","wpa":"wifi","plus":"plus","ssid":"ssid","802.1x":"8021x",
+    # VPN
+    "vpn":"vpn","anyconnect":"vpn","openvpn":"vpn","globalprotect":"vpn",
+    # Messagerie / O365
+    "outlook":"outlook","exchange":"outlook","o365":"office365","office365":"office365","m365":"office365",
+    "boite":"outlook","courriel":"outlook","mail":"outlook",
+    # Pédagogie / visioconf
+    "moodle":"moodle","teams":"visioconf","zoom":"visioconf","webex":"visioconf",
+    # Affichage / matériel
     "ecran":"ecran","écran":"ecran","noir":"noir","ecran noir":"ecran_noir","écran noir":"ecran_noir",
-    # comptes
-    "mot":"mot","passe":"passe","mot de passe":"mdp","password":"mdp","ent":"ent","sso":"sso",
-    # impression
-    "imprimante":"imprimante","impression":"imprimante",
+    "projecteur":"projecteur","videoprojecteur":"projecteur","hdmi":"hdmi","vga":"vga",
+    # Comptes / auth
+    "mot":"mot","passe":"passe","mot de passe":"mdp","password":"mdp","ent":"ent","sso":"sso","ldap":"ldap",
+    # Impression
+    "imprimante":"imprimante","impression":"imprimante","papercut":"imprimante",
+    # Proxy / réseau campus
+    "proxy":"proxy","pare-feu":"firewall","firewall":"firewall","proxy autoconfig":"proxy","pac":"proxy",
 }
 
 def strip_accents(s: str) -> str:
@@ -298,7 +321,7 @@ def jaccard(a: set, b: set):
 def text_for_ticket_base(t):
     return (t.get("name","") + "\n" + (t.get("content") or "")).strip()
 
-# --- Pagination GLPI pour tout l'historique des tickets résolus/fermés ---
+# Pagination tickets résolus/clos
 def glpi_fetch_solved_tickets_paginated(session_token, page_size=200, max_pages=25, max_total=None):
     results = []
     for page in range(max_pages):
@@ -336,18 +359,16 @@ def glpi_fetch_solved_tickets_paginated(session_token, page_size=200, max_pages=
     results.sort(key=lambda x: int(x["id"]), reverse=(SIMILAR_FETCH_ORDER == "desc"))
     return results
 
-# --- Cache d'index des tickets résolus (pour accélérer) ---
+# --- Cache d'index (tickets résolus) ---
 def _load_similar_index_cache():
     p = Path(SIMILAR_INDEX_CACHE)
-    if not p.exists():
-        return None
+    if not p.exists(): return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
     ts = float(data.get("created_at", 0))
-    if (time.time() - ts) > SIMILAR_CACHE_TTL_MIN * 60:
-        return None
+    if (time.time() - ts) > SIMILAR_CACHE_TTL_MIN * 60: return None
     return data
 
 def _save_similar_index_cache(data: dict):
@@ -381,7 +402,6 @@ def last_public_followup_text(session_token, ticket_id):
     return (pubs[-1].get("content") or "").strip()
 
 def build_case_summary(session_token, t_stub):
-    """Retourne (title, problem_snippet, solution_snippet). Complète description si absente."""
     tid = int(t_stub["id"])
     full = ensure_ticket_dict(session_token, tid)
     title = (full.get("name") or t_stub.get("name") or "").strip()
@@ -393,39 +413,84 @@ def build_case_summary(session_token, t_stub):
 #      EXTRACTION MOTS-CLÉS
 # ===============================
 def extract_keywords(title: str, content: str, top_k: int = 8) -> list[str]:
-    """
-    Extraction légère:
-    - tokens normalisés + alias (wifi, ecran_noir, vpn…)
-    - boost des tokens du TITRE (y compris bigrams aliasés)
-    - filtre stopwords + longueur minimale
-    """
     title = title or ""
     content = content or ""
-
     toks = [_alias(t) for t in _word_re.findall(strip_accents((title + "\n" + content)).lower())]
     toks = [t for t in toks if len(t) >= 3 and t not in FR_STOPWORDS]
-
     title_kw = keyword_tokens_title(title)
-
     freq = Counter(toks)
     for kw in title_kw:
         freq[kw] += 3  # bonus titre
-
     scored = freq.most_common(64)
     keywords, seen = [], set()
     for term, _ in scored:
         if term in seen: continue
-        seen.add(term)
-        keywords.append(term)
+        seen.add(term); keywords.append(term)
         if len(keywords) >= top_k: break
-
     if not keywords and title_kw:
         keywords = list(title_kw)[:top_k]
-
     return keywords
 
 # ===============================
-#  SIMILARITÉ (avec mots-clés)
+#      EMBEDDINGS (Ollama)
+# ===============================
+def _emb_cache_load():
+    p = Path(SIMILAR_EMB_CACHE)
+    if not p.exists(): return {"created_at": time.time(), "vectors": {}}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if "vectors" not in data: data["vectors"] = {}
+        return data
+    except Exception:
+        return {"created_at": time.time(), "vectors": {}}
+
+def _emb_cache_save(data):
+    data = dict(data); data["created_at"] = time.time()
+    Path(SIMILAR_EMB_CACHE).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+def _text_hash(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+def _cos(a, b):
+    if not a or not b: return 0.0
+    dot = sum(x*y for x,y in zip(a,b))
+    na = math.sqrt(sum(x*x for x in a)); nb = math.sqrt(sum(y*y for y in b))
+    if na == 0 or nb == 0: return 0.0
+    return dot/(na*nb)
+
+def embed_text(text: str) -> list[float] | None:
+    if not OLLAMA_EMBED_MODEL: return None
+    try:
+        r = requests.post(f"{OLLAMA_BASE_URL}/api/embeddings",
+                          headers=HEADERS_JSON,
+                          json={"model": OLLAMA_EMBED_MODEL, "prompt": text},
+                          timeout=60)
+        if r.status_code == 200:
+            data = r.json() or {}
+            vec = data.get("embedding")
+            if isinstance(vec, list) and vec: return [float(v) for v in vec]
+        return None
+    except Exception:
+        return None
+
+def get_or_build_ticket_embedding(session_token, ticket_id: int, cache: dict) -> list[float] | None:
+    """Embeddings pour un ticket résolu/clos (texte = titre + 1ere description + solution publique)."""
+    if not OLLAMA_EMBED_MODEL: return None
+    vstore = cache.setdefault("vectors", {})
+    info = vstore.get(str(ticket_id))
+    # reconstruit le texte de référence
+    title, prob, sol = build_case_summary(session_token, {"id": ticket_id, "name": "", "content": ""})
+    text = (title + "\n" + prob + "\n" + (sol or "")).strip()
+    h = _text_hash(text)
+    if info and info.get("h") == h and isinstance(info.get("v"), list):
+        return info["v"]
+    vec = embed_text(text)
+    if vec:
+        vstore[str(ticket_id)] = {"h": h, "v": vec}
+    return vec
+
+# ===============================
+#  SIMILARITÉ (hybride: keywords + embeddings)
 # ===============================
 def find_similar_cases(session_token, current_text, current_cat, current_title,
                        limit_back=5000, top_k=5, cur_keywords: list[str] | None = None):
@@ -439,6 +504,13 @@ def find_similar_cases(session_token, current_text, current_cat, current_title,
     cur_content_kw = tokenize(current_text or "")
     cur_kw_set     = set(cur_keywords or [])
 
+    # Embedding courant (si activé)
+    emb_cache = _emb_cache_load() if OLLAMA_EMBED_MODEL else None
+    cur_vec = embed_text(current_text) if OLLAMA_EMBED_MODEL else None
+    # TTL embedding cache
+    if emb_cache and (time.time() - emb_cache.get("created_at", 0) > SIMILAR_EMB_TTL_MIN * 60):
+        emb_cache = {"created_at": time.time(), "vectors": {}}
+
     ranked = []
     for it in idx:
         title_kw   = set(it.get("title_kw", []))
@@ -450,26 +522,33 @@ def find_similar_cases(session_token, current_text, current_cat, current_title,
 
         title_jac   = jaccard(cur_title_kw, title_kw)
         content_jac = jaccard(cur_content_kw, content_kw)
-
-        kw_overlap = 0.0
-        if cur_kw_set:
-            kw_overlap = len(cur_kw_set & (title_kw | content_kw)) / max(len(cur_kw_set), 1)
-
+        kw_overlap = (len(cur_kw_set & (title_kw | content_kw)) / max(len(cur_kw_set), 1)) if cur_kw_set else 0.0
         bonus = 0.1 if current_cat and it.get("itilcategories_id") == current_cat else 0.0
+
+        emb_cos = 0.0
+        if cur_vec is not None and emb_cache is not None:
+            vec_t = get_or_build_ticket_embedding(session_token, int(it["id"]), emb_cache)
+            if vec_t:
+                emb_cos = _cos(cur_vec, vec_t)
 
         score = (TITLE_KEYWORD_WEIGHT * title_jac +
                  CONTENT_WEIGHT * content_jac +
                  KEYWORD_SIM_WEIGHT * kw_overlap +
+                 EMBEDDING_WEIGHT * emb_cos +
                  bonus)
 
-        ranked.append((score, it))
+        ranked.append((score, it, emb_cos, title_jac, content_jac, kw_overlap))
+
+    if emb_cache is not None:
+        _emb_cache_save(emb_cache)
 
     ranked.sort(key=lambda x: x[0], reverse=True)
     out = []
-    for score, it in ranked[:top_k]:
+    for score, it, emb_cos, tj, cj, kwov in ranked[:top_k]:
         t_stub = {"id": it["id"], "name": it["title"], "content": ""}
         title, prob, sol = build_case_summary(session_token, t_stub)
         out.append({"id": it["id"], "title": title, "score": round(float(score), 3),
+                    "emb": round(float(emb_cos), 3), "tjac": round(tj,3), "cjac": round(cj,3), "kwov": round(kwov,3),
                     "problem": prob, "solution": sol})
     return out
 
@@ -483,7 +562,7 @@ def similar_cases_block(cases, current_title=""):
         overlap = ", ".join(sorted(cur_kw & title_kw)) or "—"
         sol = c["solution"] or "(solution non retrouvée)"
         lines.append(
-            f"{i}) #{c['id']} — {c['title']} (score={c['score']}, mots-clés communs: {overlap})\n"
+            f"{i}) #{c['id']} — {c['title']} (score={c['score']}, emb={c.get('emb',0)}, mots-clés communs: {overlap})\n"
             f"   Symptômes: {c['problem']}\n"
             f"   Résolution: {sol}"
         )
@@ -565,6 +644,7 @@ def technician_replied(session_token, ticket_obj) -> bool:
     def sid(x):
         try: return int(x.get("id",0))
         except: return 0
+    # du plus récent au plus ancien
     for f in sorted(flw, key=sid, reverse=True):
         content = f.get("content") or ""
         if BOT_SIGNATURE in content:
@@ -575,6 +655,34 @@ def technician_replied(session_token, ticket_obj) -> bool:
         if requester_id and uid and uid != requester_id: return True
         return False
     return False
+
+# ===============================
+#        SÉCURITÉ & TRONQUAGE
+# ===============================
+_sensitive_patterns = [
+    r"\bmot\s*de\s*passe\b", r"\bmdp\b", r"\bpassword\b", r"\bpass\b",
+    r"\bidentifiant[s]?\b.*\b(mot\s*de\s*passe|mdp|password)\b",
+    r"\bnum(é|e)ro\s*de\s*carte\b", r"\biban\b", r"\brib\b",
+    r"\bnum(é|e)ro\s*de\s*s(é|e)curit(é|e)\s*sociale\b",
+    r"\b2fa\b", r"\bcode\s*otp\b", r"\bcode\s*de\s*v(é|e)rification\b",
+    r"\btoken\b", r"\bsecret\b",
+]
+_sensitive_re = re.compile("|".join(_sensitive_patterns), re.IGNORECASE)
+
+def is_sensitive(text: str) -> bool:
+    if not text: return False
+    t = strip_accents(text.lower())
+    return bool(_sensitive_re.search(t))
+
+def truncate_reply(text: str, limit: int = MAX_REPLY_CHARS) -> str:
+    if not text or len(text) <= limit: return text
+    cut = text[:limit]
+    # essaie de couper proprement à la fin de phrase/ligne
+    for sep in [". ", "\n", "; "]:
+        p = cut.rfind(sep)
+        if p >= int(limit*0.7):
+            return cut[:p+1] + "\n\n*(réponse tronquée)*"
+    return cut.rstrip() + "…\n\n*(réponse tronquée)*"
 
 # ===============================
 #            OLLAMA
@@ -656,13 +764,16 @@ def process_once(state):
         last_seen = state["last_seen_public"].get(tid_key, -1)
         opt_out = state["opt_out"].get(tid_key, False)
 
-        dprint(f"[T{tid}] status={t.get('status')} opt_out={opt_out} last_seen={last_seen} latest_id={latest_id} force={bool(force)}")
+        if LOG_JSON:
+            log_event({"event":"scan_ticket","ticket_id":tid,"status":t.get("status"),"opt_out":bool(opt_out),
+                       "last_seen":last_seen,"latest_public_id":latest_id})
 
         # Reprise manuelle
         if opt_out and detect_resume_marker(session_token, tid):
             state["opt_out"].pop(tid_key, None)
             glpi_post_followup(session_token, tid, "Reprise automatique du bot (#resume-bot).", True)
-            dprint(f"[T{tid}] reprise via #resume-bot"); changed = True; opt_out = False
+            if LOG_JSON: log_event({"event":"resume_bot","ticket_id":tid})
+            changed = True; opt_out = False
 
         # Stop si un technicien a répondu
         if not opt_out and technician_replied(session_token, t):
@@ -670,7 +781,8 @@ def process_once(state):
             glpi_post_followup(session_token, tid,
                 "Intervention d’un **technicien** détectée. Arrêt des réponses automatiques pour CE ticket. "
                 "Pour reprendre: suivi privé avec #resume-bot.", True)
-            dprint(f"[T{tid}] Technicien détecté -> opt-out CE ticket"); changed = True; continue
+            if LOG_JSON: log_event({"event":"optout_tech","ticket_id":tid})
+            changed = True; continue
 
         if opt_out and not force:
             dprint(f"[T{tid}] SKIP: opt-out actif"); continue
@@ -684,7 +796,8 @@ def process_once(state):
                         "Demande d'échange avec un **technicien/humain** détectée. "
                         "Arrêt des réponses automatiques pour CE ticket. "
                         "Pour reprendre: suivi privé avec #resume-bot.", True)
-                    dprint(f"[T{tid}] Handoff détecté -> opt-out CE ticket"); changed = True; continue
+                    if LOG_JSON: log_event({"event":"optout_user_request","ticket_id":tid})
+                    changed = True; continue
             except Exception:
                 pass
 
@@ -694,11 +807,14 @@ def process_once(state):
         # ---------- Extraction auto de mots-clés ----------
         current_title = t.get("name","") or ""
         current_desc  = t.get("content","") or ""
-        current_text  = current_title + "\n" + current_desc
+        current_text  = (current_title + "\n" + current_desc).strip()
 
         kw = extract_keywords(current_title, current_desc, top_k=KEYWORDS_TOP_K)
-        state["keywords"][tid_key] = kw  # mémoire locale (optionnel)
-        dprint(f"[T{tid}] keywords={kw}")
+        state["keywords"][tid_key] = kw  # mémoire locale
+        if LOG_JSON: log_event({"event":"keywords","ticket_id":tid,"keywords":kw})
+
+        # ---------- Sensible ? Forcer privé/tech ----------
+        sensitive_in = is_sensitive(current_text)
 
         # ---------- Recherche de cas similaires ----------
         sims = find_similar_cases(
@@ -710,6 +826,7 @@ def process_once(state):
             top_k=SIMILAR_TOP_K,
             cur_keywords=kw,
         )
+        if LOG_JSON: log_event({"event":"similar_top","ticket_id":tid,"top":[{"id":c["id"],"score":c["score"],"emb":c.get("emb",0)} for c in sims]})
         sims_block = similar_cases_block(sims, current_title=current_title)
 
         # ---------- Contexte + génération ----------
@@ -727,25 +844,41 @@ def process_once(state):
         )
         messages = [{"role": "system", "content": SYSTEM_RULES}] + conv
 
-        dprint(f"[T{tid}] -> génération…")
         resp = ask_ollama(messages)
         reply = resp.get("reply") or "Message pris en compte."
         audience = resp.get("audience") or "technician"
         public_reply = bool(resp.get("public_reply"))
+        confidence = int(resp.get("confidence") or 0)
+
+        # Garde-fous sécurité
+        if sensitive_in or is_sensitive(reply):
+            audience = "technician"; public_reply = False
+
+        # Tronquage doux
+        reply = truncate_reply(reply, MAX_REPLY_CHARS)
 
         # Anti-doublon
         prev = last_bot_reply(session_token, tid)
         if prev and too_similar(prev, reply):
-            dprint(f"[T{tid}] SKIP: réponse trop similaire à la précédente")
+            if LOG_JSON: log_event({"event":"dedupe_skip","ticket_id":tid})
             state["last_seen_public"][tid_key] = latest_id
             changed = True
             continue
 
-        # Envoi (public si self-service, sinon privé technicien)
+        # Routage final
         is_private = not public_reply or (audience != "user")
         glpi_post_followup(session_token, tid, reply, is_private=is_private)
+
+        # Mémo par ticket
+        meta = state["ticket_meta"].setdefault(tid_key, {})
+        meta.update({"last_audience": audience, "last_public": bool(public_reply), "last_confidence": confidence, "ts": time.time()})
+
         state["last_seen_public"][tid_key] = latest_id
-        dprint(f"[T{tid}] OK: suivi {'privé' if is_private else 'public'} déposé")
+        if LOG_JSON:
+            log_event({"event":"posted","ticket_id":tid,"private":bool(is_private),
+                       "audience":audience,"public_reply":bool(public_reply),"confidence":confidence,
+                       "reply_len":len(reply)})
+
         changed = True
 
     return changed
