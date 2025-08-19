@@ -1,37 +1,66 @@
-# Qwen ↔ GLPI Bot (Ollama)
+🧠 GLPI ↔ Qwen Bot (Ollama)
 
-Assistant qui lit les tickets GLPI, propose des réponses (privées/publics), s’arrête si un technicien répond, et s’inspire de cas similaires via un mini-RAG.
-Inclut Docker Compose + tests unitaires + E2E (optionnels).
+Assistant qui lit les tickets GLPI et propose des réponses structurées : diagnostics pas-à-pas, questions ciblées, et procédures.
+Il s’arrête automatiquement si un technicien intervient ou si l’utilisateur demande un humain, et peut reprendre via #resume-bot.
 
-## Démarrage rapide (Docker Compose)
+🚀 Utilité
 
-1. Copiez `.env.example` en `.env` et **renseignez** les tokens GLPI.
-2. Lancez :
-   ```bash
-   docker compose up -d --build
-   ```
-3. Le service `bot` tourne en continu. Pour un passage unique :
-   ```bash
-   docker compose run --rm bot python app.py --once
-   ```
+Gain de temps pour le support : tri et premières réponses sur les incidents fréquents (Wi-Fi/eduroam, VPN, Outlook, impressions, ENT/Moodle…).
 
-## Services
+Qualité constante : réponses en FR (ou EN si ticket anglais), 4–6 étapes max, sans actions destructives, respect RGPD.
 
-- **ollama** : sert le modèle `qwen2.5:1.5b-instruct`.
-- **bot** : exécute `app.py`. Monte un volume `/data` pour `state.json` et `similar_index.json`.
+Self-service quand c’est possible : si l’utilisateur peut résoudre seul, le bot poste une réponse publique ; sinon, il laisse un brouillon privé pour les techs.
 
-## Variables principales
+🏗️ Conception (vue d’ensemble)
 
-Voir `.env.example`. Les plus importantes :
-- `GLPI_URL`, `GLPI_APP_TOKEN`, `GLPI_USER_TOKEN`
-- `OLLAMA_BASE_URL` (par défaut `http://ollama:11434`)
+GLPI API
 
-## Tests
+Liste des tickets actifs (statuts 1/2/3) et de leurs suivis.
 
-- **Unitaires (sans GLPI)** :
-  ```bash
-  pip install -r requirements.txt
-  pytest -q
-  ```
+Poste des suivis (public/privé) signés “— Réponse générée par Qwen (brouillon)”.
 
-- **E2E (réels)** : voir `.github/workflows/e2e-live.yml` (nécessite secrets GLPI et accès réseau).
+Détecte les réponses tech et mots-clés d’escalade (“je veux parler à un technicien”) → opt-out par ticket.
+
+Reprise via suivi privé #resume-bot.
+
+Mémoire conversationnelle
+
+Historique condensé par ticket (dernier N messages publics + précédents du bot).
+
+RAG léger sur l’historique
+
+Indexe les tickets résolus/clos (pagination GLPI) dans un cache.
+
+Recherche de cas similaires pondérée par les mots-clés du titre, le contenu et des mots-clés extraits automatiquement (alias simples : wifi, ecran_noir, vpn, etc.).
+
+Injecte des résumés de résolutions trouvés dans le prompt du modèle.
+
+Génération (Ollama/Qwen 2.5)
+
+Appelle /api/chat (JSON schema) avec fallback sûr sur /api/generate.
+
+Sortie JSON stricte : reply, confidence, tags, close_candidate, audience (user|technician), public_reply (booleen).
+
+Anti-doublon : n’envoie pas 2 fois la même réponse.
+
+Ops & perfs
+
+Polling adaptatif, cache d’index similaire, limitation de tickets par cycle.
+
+Docker Compose prêt, image GHCR auto-publiée (workflow Actions).
+
+⚙️ Déploiement rapide
+
+Docker Compose local : docker compose up -d --build
+
+Image GHCR : docker pull ghcr.io/<owner>/qwen-glpi-bot:latest
+
+Variables nécessaires : GLPI_URL, GLPI_APP_TOKEN, GLPI_USER_TOKEN, OLLAMA_BASE_URL (par défaut http://ollama:11434).
+
+🔐 Sécurité et garde-fous
+
+Jamais d’action destructive automatisée.
+
+Respect des données sensibles ; le bot oriente vers un tech quand nécessaire.
+
+Arrêt automatique sur intervention humaine.
